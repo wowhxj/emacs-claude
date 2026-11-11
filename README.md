@@ -102,6 +102,7 @@ Claude 只提供「按 uuid 撤回排队消息」的接口，因此应用时会�
 - 空闲的 holder 不会自动退出；用 `C-c C-q` 关闭，或用 `emacs-claude-attach` 找回。
 - `out.jsonl` 只追加、不轮转；重启 holder 时保留一份 `out.prev.jsonl`。
 - `sent.jsonl` 同样只追加，包含已发送图片的 base64。
+- 发送大图时 Emacs 会短暂停顿（实测两张 2.4 MB 图片约 2.4 秒），用于把数据写入 holder。
 - 队列编辑依赖 CLI 的 `cancel_async_message` 与 `command_lifecycle`（2.1.322 实测可用，属于未公开接口，CLI 升级后可能变化）。
 - 队列编辑器不能增删单条消息里的图片；Linux/WSL 没有剪贴板图片粘贴。
 - 尚未实现：子智能体消息展示、fork/clone/export。

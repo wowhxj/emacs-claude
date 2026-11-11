@@ -66,7 +66,8 @@
 (defvar-local emacs-claude--id nil "Session id; also the holder directory name.")
 (defvar-local emacs-claude--root nil)
 (defvar-local emacs-claude--tail nil "The `tail -f' viewer process.")
-(defvar-local emacs-claude--partial "" "Incomplete trailing log line.")
+(defvar-local emacs-claude--receive nil "Buffer of log text not yet parsed.")
+(defvar-local emacs-claude--writer nil "Process that feeds the holder's FIFO.")
 (defvar-local emacs-claude--replay-left 0
   "Bytes of pre-existing log not yet replayed; positive means catching up.")
 (defvar-local emacs-claude--items nil
@@ -146,11 +147,20 @@
   "cd \"$1\" || exit 1
 d=$2; shift 2
 exec 3<>\"$d/in\"
-echo $$ > \"$d/pid\"
 printf '%s\\n' '{\"type\":\"control_request\",\"request_id\":\"init\",\"request\":{\"subtype\":\"initialize\"}}' >&3
-exec \"$@\" <&3 >>\"$d/out.jsonl\" 2>>\"$d/err\""
+cat <&3 | {
+  \"$@\" <&0 >>\"$d/out.jsonl\" 2>>\"$d/err\" &
+  echo $! > \"$d/pid\"
+  wait $!
+  exec 0<&-
+  echo >&3
+}"
   "Shell program: ROOT DIR COMMAND...  Opening the FIFO read-write means no
-writer ever has to stay connected, and its own first line initializes Claude.")
+writer ever has to stay connected, and its own first line initializes Claude.
+Claude reads through `cat' because it stops reading a FIFO stdin after about
+64 KiB, which an image prompt exceeds.  The pid file names Claude itself.
+Once Claude exits, nothing reads the pipe, so the final newline makes the
+relay `cat' fail on its next write and exit.")
 
 (defun emacs-claude--dir (id)
   "Return holder directory of session ID."
@@ -228,15 +238,18 @@ writer ever has to stay connected, and its own first line initializes Claude.")
 
 (defun emacs-claude--write (object)
   "Send JSON OBJECT to this chat's Claude."
-  ;; Opening a FIFO nobody reads would block Emacs, so check first.
   (unless (emacs-claude--alive-p emacs-claude--id)
     (user-error "Claude is not running; C-c C-r resumes this session"))
-  (let ((coding-system-for-write 'utf-8-unix))
-    (unless (eq 0 (call-process-region
-                   (concat (emacs-claude--encode object) "\n") nil
-                   "sh" nil nil nil "-c" "cat > \"$0\""
-                   (emacs-claude--file emacs-claude--id "in")))
-      (error "Writing to Claude failed"))))
+  ;; One long-lived asynchronous writer: Emacs never waits on the FIFO, and
+  ;; messages larger than a pipe buffer cannot interleave.
+  (unless (process-live-p emacs-claude--writer)
+    (setq emacs-claude--writer
+          (make-process :name "emacs-claude-writer" :noquery t
+                        :connection-type 'pipe :coding 'utf-8-unix
+                        :command (list "sh" "-c" "exec cat > \"$0\""
+                                       (emacs-claude--file emacs-claude--id "in")))))
+  (process-send-string emacs-claude--writer
+                       (concat (emacs-claude--encode object) "\n")))
 
 (defun emacs-claude--control-then (callback subtype &rest pairs)
   "Send control request SUBTYPE with PAIRS; call CALLBACK with its response.
@@ -418,12 +431,22 @@ CALLBACK may be nil.  It runs in the chat buffer and receives nil on error."
   "Feed log CHUNK from the tail process into chat BUFFER."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (let* ((replaying (> emacs-claude--replay-left 0))
-             (lines (split-string (concat emacs-claude--partial chunk) "\n")))
+      (let ((replaying (> emacs-claude--replay-left 0))
+            lines)
         (setq emacs-claude--replay-left
-              (max 0 (- emacs-claude--replay-left (string-bytes chunk)))
-              emacs-claude--partial (car (last lines)))
-        (dolist (line (butlast lines))
+              (max 0 (- emacs-claude--replay-left (string-bytes chunk))))
+        ;; A buffer, not string concatenation: an image prompt is one log line
+        ;; of megabytes arriving in small chunks, and rescanning it each time
+        ;; would be quadratic.
+        (with-current-buffer emacs-claude--receive
+          (goto-char (point-max))
+          (let ((from (point)))
+            (insert chunk)
+            (goto-char from))
+          (while (search-forward "\n" nil t)
+            (push (buffer-substring-no-properties (point-min) (1- (point))) lines)
+            (delete-region (point-min) (point))))
+        (dolist (line (nreverse lines))
           ;; Replayed deltas are superseded by the complete messages that
           ;; follow them; skipping them keeps a long log quick to attach.
           (unless (or (string-empty-p line)
@@ -1346,6 +1369,9 @@ ACTIVE means Claude is still working on it."
 (defun emacs-claude--cleanup ()
   "Drop this viewer.  The holder is deliberately left running."
   (when (process-live-p emacs-claude--tail) (delete-process emacs-claude--tail))
+  ;; EOF rather than kill, so a prompt sent just before closing still arrives.
+  (when (process-live-p emacs-claude--writer) (process-send-eof emacs-claude--writer))
+  (when (buffer-live-p emacs-claude--receive) (kill-buffer emacs-claude--receive))
   (when (buffer-live-p emacs-claude--queue-buffer)
     (kill-buffer emacs-claude--queue-buffer))
   (dolist (timer (list emacs-claude--render-timer emacs-claude--spinner-timer
@@ -1369,62 +1395,71 @@ ACTIVE means Claude is still working on it."
 
 (defun emacs-claude--open (id root)
   "Return a chat buffer attached to session ID in ROOT, starting it if needed."
-  (or (cl-find id (emacs-claude--chats) :test #'equal
-               :key (lambda (buffer) (buffer-local-value 'emacs-claude--id buffer)))
-      (let ((buffer (generate-new-buffer
-                     (format "*claude:%s#%s*"
-                             (file-name-nondirectory (directory-file-name root))
-                             (substring id 0 6)))))
-        (unless (emacs-claude--alive-p id)
-          (emacs-claude--start-holder id root))
-        (with-current-buffer buffer
-          (setq default-directory root)
-          (emacs-claude-chat-mode)
-          (setq emacs-claude--id id emacs-claude--root root)
-          (let ((prefix (propertize emacs-claude--composer-prefix 'read-only t)))
-            (add-text-properties 0 1 '(front-sticky (read-only)) prefix)
-            (add-text-properties (1- (length prefix)) (length prefix)
-                                 '(rear-nonsticky (read-only)) prefix)
-            (insert prefix)
-            (save-excursion
-              (insert (propertize "\n" 'read-only t 'rear-nonsticky '(read-only)))))
-          (setq emacs-claude--input-marker (copy-marker (point-min) t)
-                emacs-claude--input-background
-                (make-overlay (1+ (point-min)) (point-max) nil t t))
-          (overlay-put emacs-claude--input-background 'face 'emacs-claude-input-face)
-          (setq buffer-undo-list nil)
-          ;; What a resumed holder's log cannot show comes from the transcript.
-          (let ((meta (emacs-claude--meta id))
-                (transcript (emacs-claude--transcript-file id root))
-                (log (emacs-claude--file id "out.jsonl"))
-                (sent (emacs-claude--file id "sent.jsonl")))
-            (when (file-readable-p sent)
-              (with-temp-buffer
-                (insert-file-contents sent)
-                (let ((table (buffer-local-value 'emacs-claude--sent buffer)))
-                  (while (not (eobp))
-                    (when-let* ((record (ignore-errors
-                                          (emacs-claude--parse
-                                           (buffer-substring (point)
-                                                             (line-end-position))))))
-                      (puthash (emacs-claude--get record "uuid")
-                               (emacs-claude--get record "content") table))
-                    (forward-line 1)))))
-            (when (and (eq (emacs-claude--get meta "resumed") t)
-                       (file-readable-p transcript))
-              (emacs-claude--load-history transcript
-                                          (emacs-claude--get meta "started")))
-            (setq emacs-claude--replay-left
-                  (file-attribute-size (file-attributes log))
-                  emacs-claude--tail
-                  (make-process
-                   :name "emacs-claude-tail" :noquery t :connection-type 'pipe
-                   :coding 'utf-8-unix
-                   :command (list "tail" "-c" "+1" "-f" log)
-                   :filter (lambda (_process chunk)
-                             (emacs-claude--filter buffer chunk)))))
-          (emacs-claude--schedule))
-        buffer)))
+  (let ((open (cl-find id (emacs-claude--chats) :test #'equal
+                       :key (lambda (buffer) (buffer-local-value 'emacs-claude--id buffer)))))
+    ;; A chat whose Claude has exited is reopened, which resumes it.
+    (when (and open (not (emacs-claude--alive-p id)))
+      (let ((draft (with-current-buffer open (emacs-claude--input-text))))
+        (kill-buffer open)
+        (setq open (emacs-claude--open id root))
+        (with-current-buffer open (emacs-claude--input-set draft))))
+    (or open
+	(let ((buffer (generate-new-buffer
+                       (format "*claude:%s#%s*"
+                               (file-name-nondirectory (directory-file-name root))
+                               (substring id 0 6)))))
+          (unless (emacs-claude--alive-p id)
+            (emacs-claude--start-holder id root))
+          (with-current-buffer buffer
+            (setq default-directory root)
+            (emacs-claude-chat-mode)
+            (setq emacs-claude--receive
+                  (generate-new-buffer " *emacs-claude-receive*" t))
+            (setq emacs-claude--id id emacs-claude--root root)
+            (let ((prefix (propertize emacs-claude--composer-prefix 'read-only t)))
+              (add-text-properties 0 1 '(front-sticky (read-only)) prefix)
+              (add-text-properties (1- (length prefix)) (length prefix)
+                                   '(rear-nonsticky (read-only)) prefix)
+              (insert prefix)
+              (save-excursion
+		(insert (propertize "\n" 'read-only t 'rear-nonsticky '(read-only)))))
+            (setq emacs-claude--input-marker (copy-marker (point-min) t)
+                  emacs-claude--input-background
+                  (make-overlay (1+ (point-min)) (point-max) nil t t))
+            (overlay-put emacs-claude--input-background 'face 'emacs-claude-input-face)
+            (setq buffer-undo-list nil)
+            ;; What a resumed holder's log cannot show comes from the transcript.
+            (let ((meta (emacs-claude--meta id))
+                  (transcript (emacs-claude--transcript-file id root))
+                  (log (emacs-claude--file id "out.jsonl"))
+                  (sent (emacs-claude--file id "sent.jsonl")))
+              (when (file-readable-p sent)
+		(with-temp-buffer
+                  (insert-file-contents sent)
+                  (let ((table (buffer-local-value 'emacs-claude--sent buffer)))
+                    (while (not (eobp))
+                      (when-let* ((record (ignore-errors
+                                            (emacs-claude--parse
+                                             (buffer-substring (point)
+                                                               (line-end-position))))))
+			(puthash (emacs-claude--get record "uuid")
+				 (emacs-claude--get record "content") table))
+                      (forward-line 1)))))
+              (when (and (eq (emacs-claude--get meta "resumed") t)
+			 (file-readable-p transcript))
+		(emacs-claude--load-history transcript
+                                            (emacs-claude--get meta "started")))
+              (setq emacs-claude--replay-left
+                    (file-attribute-size (file-attributes log))
+                    emacs-claude--tail
+                    (make-process
+                     :name "emacs-claude-tail" :noquery t :connection-type 'pipe
+                     :coding 'utf-8-unix
+                     :command (list "tail" "-c" "+1" "-f" log)
+                     :filter (lambda (_process chunk)
+                               (emacs-claude--filter buffer chunk)))))
+            (emacs-claude--schedule))
+          buffer))))
 
 (defun emacs-claude--show (buffer)
   "Display chat BUFFER alone in the frame, ready for input."
@@ -1597,18 +1632,19 @@ PROJECT adds a project column."
   "Choose the model for the following turns."
   (interactive)
   (let* ((models (mapcar (lambda (model)
-                           (cons (format "%s  %s"
-                                         (emacs-claude--get model "value")
+                           (cons (format "%-22s %-26s %s"
+                                         (emacs-claude--get model "displayName")
+                                         (emacs-claude--get model "resolvedModel")
                                          (or (emacs-claude--get model "description") ""))
-                                 (emacs-claude--get model "value")))
+                                 model))
                          (append emacs-claude--models nil)))
          (model (cdr (assoc (completing-read
                              "Model: "
                              (or models (user-error "Models not reported yet"))
                              nil t)
                             models))))
-    (emacs-claude--control "set_model" "model" model)
-    (setq emacs-claude--model model)
+    (emacs-claude--control "set_model" "model" (emacs-claude--get model "value"))
+    (setq emacs-claude--model (emacs-claude--get model "resolvedModel"))
     (force-mode-line-update)))
 
 (defun emacs-claude-select-permission-mode ()

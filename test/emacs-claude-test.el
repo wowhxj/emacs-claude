@@ -142,4 +142,23 @@
        (emacs-claude--render)
        (should (string-search "[image]" (buffer-string)))))))
 
+(ert-deftest emacs-claude-large-prompt-round-trip ()
+  "A multi-megabyte image prompt is written and its echo parsed quickly."
+  (emacs-claude-test--with-chat
+   (let ((png (concat tmp "big.png"))
+         (coding-system-for-write 'no-conversion))
+     (write-region (concat (unibyte-string 137 80 78 71 13 10 26 10)
+                           (make-string (* 3 1024 1024) ?a))
+                   nil png nil 'silent)
+     (with-current-buffer (emacs-claude--open id root)
+       (emacs-claude-test--wait (lambda () emacs-claude--models))
+       (let ((emacs-claude-image-max-bytes (* 8 1024 1024))
+             (start (float-time)))
+         (emacs-claude-attach-image png)
+         (emacs-claude-test--send "big")
+         (emacs-claude-test--wait
+          (lambda () (string-search "echo:big +1 image" (buffer-string))))
+         (message "large prompt round trip: %.2fs" (- (float-time) start))
+         (should (< (- (float-time) start) 5)))))))
+
 ;;; emacs-claude-test.el ends here
