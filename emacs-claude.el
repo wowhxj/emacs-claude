@@ -191,6 +191,11 @@ relay `cat' fail on its next write and exit.")
   (when-let* ((pid (emacs-claude--pid id)))
     (eq 0 (ignore-errors (signal-process pid 0)))))
 
+(defun emacs-claude-session-running-p (id)
+  "Whether Claude session ID still runs in a detached emacs-claude holder.
+Other packages, such as ashub, use this to mark background sessions."
+  (emacs-claude--alive-p id))
+
 (defun emacs-claude--meta (id)
   "Return holder metadata of ID as a JSON object, or nil."
   (let ((file (emacs-claude--file id "meta.json")))
