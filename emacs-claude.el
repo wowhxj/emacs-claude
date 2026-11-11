@@ -645,7 +645,7 @@ CALLBACK may be nil.  It runs in the chat buffer and receives nil on error."
   (emacs-claude--history -1))
 
 (defconst emacs-claude--client-commands
-  '(("/resume" emacs-claude-resume "Resume a session of this project")
+  '(("/resume" emacs-claude-resume "Resume a session from any project")
     ("/new" emacs-claude-new-session "New session in this project")
     ("/attach" emacs-claude-attach "Open a Claude still running in the background")
     ("/model" emacs-claude-select-model "Choose the model")
@@ -707,7 +707,7 @@ CALLBACK may be nil.  It runs in the chat buffer and receives nil on error."
                                   :test #'equal))
              (session (emacs-claude--pick
                        (or sessions (user-error "No other saved sessions"))
-                       "Claude session reference: " nil t)))
+                       "Claude session reference: ")))
         (delete-region start end)
         (goto-char start)
         (insert (format "@[%s](claude-session:%s) "
@@ -1561,11 +1561,20 @@ With ROOT only that project's sessions, otherwise those of every project."
         (concat (truncate-string-to-width value head) "…"
                 (truncate-string-to-width value total (- total tail)))))))
 
-(defun emacs-claude--pick (sessions prompt &optional new-label project)
+(defconst emacs-claude--running-mark (propertize " ● running" 'face 'success)
+  "Suffix for sessions still running in a detached holder.")
+
+(defun emacs-claude--pick (sessions prompt &optional new-label)
   "Choose among SESSIONS with PROMPT; return a plist, or `new' for NEW-LABEL.
-Columns follow emacs-pi: last user time | first query | last query |
-project (with PROJECT, on wide frames) | ID, under a header row."
-  (let* ((width (- (window-body-width (minibuffer-window)) 4))
+NEW-LABEL, when given, is offered after the sessions.  The table matches
+emacs-pi and emacs-dsh: last user time | first query | last query | project
+\(wide frames) | ID under a header row, running sessions marked."
+  (let* ((running (cl-remove-if-not
+                   (lambda (session) (emacs-claude--alive-p (plist-get session :id)))
+                   sessions))
+         ;; Leave room for the running mark so marked rows still fit.
+         (width (- (window-body-width (minibuffer-window)) 4
+                   (if running (string-width emacs-claude--running-mark) 0)))
          (ids (mapcar (lambda (session) (plist-get session :id)) sessions))
          (id-width 12)
          (_ (while (< (length (delete-dups
@@ -1573,7 +1582,7 @@ project (with PROJECT, on wide frames) | ID, under a header row."
                                         ids)))
                       (length ids))
               (cl-incf id-width)))
-         (project-width (if (and project (>= width 120)) (min 30 (/ width 6)) 0))
+         (project-width (if (>= width 120) (min 30 (/ width 6)) 0))
          (query-space (max 12 (- width 16 id-width 9
                                  (if (> project-width 0) (+ project-width 3) 0))))
          (first-width (/ query-space 2))
@@ -1595,7 +1604,6 @@ project (with PROJECT, on wide frames) | ID, under a header row."
          (header (funcall row "最后交互" "用户首句" "用户末句" "项目" "ID" t))
          (choices
           (append
-           (and new-label (list (cons new-label 'new)))
            (mapcar
             (lambda (session)
               (let ((id (plist-get session :id)))
@@ -1607,11 +1615,10 @@ project (with PROJECT, on wide frames) | ID, under a header row."
                                   "—")
                                 (plist-get session :first) (plist-get session :last)
                                 (plist-get session :cwd) id)
-                       (if (emacs-claude--alive-p id)
-                           (propertize " ● running" 'face 'success)
-                         ""))
+                       (and (memq session running) emacs-claude--running-mark))
                       session)))
-            sessions)))
+            sessions)
+           (and new-label (list (cons new-label 'new)))))
          (table (lambda (string predicate action)
                   (if (eq action 'metadata)
                       `(metadata (category . emacs-claude-session)
@@ -1636,7 +1643,9 @@ project (with PROJECT, on wide frames) | ID, under a header row."
   (let* ((root (emacs-claude--root-of root))
          (sessions (emacs-claude--sessions root))
          (choice (if sessions
-                     (emacs-claude--pick sessions "Session: " "+ New session")
+                     (emacs-claude--pick
+                      sessions "Claude session in this directory (choose or create): "
+                      "[New session]")
                    'new)))
     (emacs-claude--show
      (emacs-claude--open (if (eq choice 'new) (emacs-claude--uuid)
@@ -1653,35 +1662,45 @@ project (with PROJECT, on wide frames) | ID, under a header row."
 
 ;;;###autoload
 (defun emacs-claude-resume ()
-  "Resume a saved session of this project; attach if it is still running."
+  "Resume a saved session from any project; attach if it is still running."
   (interactive)
-  (let* ((root (or emacs-claude--root
-                   (emacs-claude--root-of (read-directory-name "Claude project: "))))
-         (session (emacs-claude--pick
-                   (or (emacs-claude--sessions root)
-                       (user-error "No saved sessions for %s" root))
-                   "Resume: ")))
-    (emacs-claude--show (emacs-claude--open (plist-get session :id) root))))
+  (emacs-claude--open-picked
+   (emacs-claude--pick (or (emacs-claude--sessions)
+                           (user-error "No saved Claude sessions"))
+                       "Resume Claude session: ")))
+
+(defun emacs-claude--open-picked (session)
+  "Show a chat for picked SESSION in the project it last ran in."
+  (let ((cwd (plist-get session :cwd)))
+    (emacs-claude--show
+     (emacs-claude--open
+      (plist-get session :id)
+      (emacs-claude--root-of
+       (if (and cwd (file-directory-p cwd))
+           cwd
+         (read-directory-name (format "Project of session %s: "
+                                      (substring (plist-get session :id) 0 8)))))))))
 
 ;;;###autoload
 (defun emacs-claude-attach ()
   "Open a Claude that is still running in the background, in any project."
   (interactive)
   (let* ((instances (expand-file-name "instances" emacs-claude-directory))
+         (saved (emacs-claude--sessions))
          (running
           (cl-loop for id in (and (file-directory-p instances)
                                   (directory-files instances nil "\\`[^.]"))
                    for root = (emacs-claude--get (emacs-claude--meta id) "root")
                    when (and root (emacs-claude--alive-p id))
-                   collect (cons (format "%s  %s" (substring id 0 8)
-                                         (abbreviate-file-name root))
-                                 (cons id root))))
-         (choice (cdr (assoc (completing-read
-                              "Running Claude: "
-                              (or running (user-error "No Claude is running"))
-                              nil t)
-                             running))))
-    (emacs-claude--show (emacs-claude--open (car choice) (cdr choice)))))
+                   ;; A holder that has not been sent a prompt has no
+                   ;; transcript yet, so it gets a row of its own.
+                   collect (or (cl-find id saved :key (lambda (session)
+                                                        (plist-get session :id))
+                                        :test #'equal)
+                               (list :id id :cwd root)))))
+    (emacs-claude--open-picked
+     (emacs-claude--pick (or running (user-error "No Claude is running"))
+                         "Running Claude session: "))))
 
 (defun emacs-claude-switch-chat ()
   "Switch to another open Claude chat."

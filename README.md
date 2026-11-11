@@ -30,8 +30,9 @@ holder 已退出的会话通过 `claude --resume` 重新启动，历史从 Claud
 
 ## 使用
 
-`M-x emacs-claude-chat`：选目录，再选已有会话或新建。`● running` 表示该会话仍在后台运行。
-`M-x emacs-claude-attach`：列出所有项目中仍在后台运行的 Claude。
+`M-x emacs-claude-chat`：选目录，再选该目录的已有会话或最后一行的 `[New session]`。
+`C-c C-r`（`/resume`）：从所有项目的会话中恢复；`M-x emacs-claude-attach`：只列仍在后台运行的会话。
+三个列表与 `@session`、emacs-pi、emacs-dsh 使用同一表格：「最后交互｜用户首句｜用户末句｜项目｜ID」，按最后用户交互倒序，窄窗口隐藏项目列，仍在后台运行的会话行尾标记 `● running`。
 
 | 操作 | 快捷键 |
 | --- | --- |

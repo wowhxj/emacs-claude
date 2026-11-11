@@ -176,4 +176,35 @@
          (emacs-claude-complete))
        (should (equal (emacs-claude--input-text) "@src.el"))))))
 
+(ert-deftest emacs-claude-session-picker-matches-other-clients ()
+  "Pickers share one table: header row, all projects, [New session] last."
+  (emacs-claude-test--with-chat
+   (cl-flet ((transcript (dir sid text cwd)
+               (make-directory dir t)
+               (write-region
+                (format "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":%S},\"timestamp\":\"2026-01-0%dT00:00:00.000Z\",\"cwd\":%S}\n"
+                        text (if (equal sid "a") 1 2) cwd)
+                nil (concat dir sid ".jsonl") nil 'silent)))
+     (transcript (concat emacs-claude-config-directory "projects/-one/") "a" "first one" root)
+     (transcript (concat emacs-claude-config-directory "projects/-two/") "b" "second two" tmp)
+     (let (rows header prompt)
+       (cl-letf (((symbol-function 'completing-read)
+                  (lambda (p table &rest _)
+                    (setq prompt p rows (all-completions "" table)
+                          header (funcall (alist-get 'group-function
+                                                     (cdr (funcall table "" nil 'metadata)))
+                                          (car rows) nil))
+                    (car (last rows))))
+                 ((symbol-function 'window-body-width) (lambda (&rest _) 200)))
+         (should (eq (emacs-claude--pick (emacs-claude--sessions) "Resume Claude session: "
+                                         "[New session]")
+                     'new)))
+       (should (equal prompt "Resume Claude session: "))
+       (should (string-match-p "最后交互.*用户首句.*用户末句.*项目.*ID" header))
+       (should (equal (car (last rows)) "[New session]"))
+       (should (string-match-p "second two" (car rows)))
+       (should (string-match-p "first one" (cadr rows)))
+       (dolist (row (butlast rows))
+         (should (= (string-width row) (string-width header))))))))
+
 ;;; emacs-claude-test.el ends here
