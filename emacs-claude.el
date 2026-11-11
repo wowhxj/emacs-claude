@@ -43,6 +43,13 @@
 (defcustom emacs-claude-pngpaste-executable "pngpaste"
   "Program that writes the macOS clipboard image to a PNG file."
   :type 'string)
+(defcustom emacs-claude-reference-providers nil
+  "Alist of (NAME . FUNCTION) for external @NAME references.
+TAB after @NAME calls FUNCTION with the chat's project root.  It returns a
+file path, inserted as an @ reference, or nil to leave the draft alone.
+The same contract as `emacs-pi-reference-providers', so ashub can add
+\"ashub\" here."
+  :type '(alist :key-type string :value-type function))
 (defcustom emacs-claude-session-reference-max-chars 20000
   "Characters of earlier conversation appended for all @session references."
   :type 'integer)
@@ -656,13 +663,25 @@ CALLBACK may be nil.  It runs in the chat buffer and receives nil on error."
                    (emacs-claude--get command "description")))
            (append emacs-claude--commands nil))))
 
+(defun emacs-claude--file-mention (file)
+  "Return an @ reference to FILE in Claude Code's syntax."
+  (let* ((relative (file-relative-name file emacs-claude--root))
+         (path (if (string-prefix-p ".." relative) (abbreviate-file-name file) relative)))
+    (if (string-match-p "[[:space:]]" path) (format "@\"%s\"" path) (concat "@" path))))
+
 (defun emacs-claude-complete ()
-  "Complete the /command or @file before point in the minibuffer."
+  "Complete the /command, @file, @session or @provider before point."
   (interactive)
   (let* ((begin (emacs-claude--input-beginning))
-         (end (point))
-         (start (save-excursion (skip-chars-backward "^ \t\n" begin) (point)))
-         (token (and (>= end begin) (buffer-substring-no-properties start end))))
+         ;; Markers: Claude's output can redraw the transcript above the
+         ;; composer while the minibuffer is open.
+         (end (copy-marker (point) t))
+         (start (copy-marker
+                 (save-excursion (skip-chars-backward "^ \t\n" begin) (point))))
+         (token (and (>= end begin) (buffer-substring-no-properties start end)))
+         (provider (and token (string-match "\\`@\\([[:alnum:]_-]+\\)\\'" token)
+                        (cdr (assoc (match-string 1 token)
+                                    emacs-claude-reference-providers)))))
     (cond
      ((and token (= start begin) (string-prefix-p "/" token))
       (let* ((choices (emacs-claude--slash-choices))
@@ -675,6 +694,7 @@ CALLBACK may be nil.  It runs in the chat buffer and receives nil on error."
                                       70 nil nil "…"))))))
              (choice (completing-read "Command: " choices nil nil token)))
         (delete-region start end)
+        (goto-char start)
         (insert choice " ")))
      ((and token (string-prefix-p "@session" token))
       (let* ((sessions (cl-remove emacs-claude--id (emacs-claude--sessions)
@@ -682,8 +702,9 @@ CALLBACK may be nil.  It runs in the chat buffer and receives nil on error."
                                   :test #'equal))
              (session (emacs-claude--pick
                        (or sessions (user-error "No other saved sessions"))
-                       "Reference session: " nil t)))
+                       "Claude session reference: " nil t)))
         (delete-region start end)
+        (goto-char start)
         (insert (format "@[%s](claude-session:%s) "
                         (truncate-string-to-width
                          (replace-regexp-in-string
@@ -691,14 +712,17 @@ CALLBACK may be nil.  It runs in the chat buffer and receives nil on error."
                                    "[\r\n]+" " " (plist-get session :first)))
                          64 nil nil "…")
                         (plist-get session :id)))))
-     ((and token (string-prefix-p "@" token))
-      (let* ((file (read-file-name "File: " emacs-claude--root nil nil
-                                   (substring token 1)))
-             (relative (file-relative-name file emacs-claude--root)))
+     (provider
+      (when-let* ((file (funcall provider emacs-claude--root)))
         (delete-region start end)
-        (insert "@" (if (string-prefix-p ".." relative)
-                        (abbreviate-file-name file)
-                      relative))))
+        (goto-char start)
+        (insert (emacs-claude--file-mention file) " ")))
+     ((and token (string-prefix-p "@" token))
+      (let ((file (read-file-name "File: " emacs-claude--root nil nil
+                                  (substring token 1))))
+        (delete-region start end)
+        (goto-char start)
+        (insert (emacs-claude--file-mention file))))
      (t (user-error "Type / or @ first, then TAB")))))
 
 (defun emacs-claude-send (&optional steer)
@@ -1514,40 +1538,90 @@ With ROOT only that project's sessions, otherwise those of every project."
      (lambda (a b) (string> (or (plist-get a :stamp) "")
                             (or (plist-get b :stamp) ""))))))
 
-(defun emacs-claude--session-label (session &optional project)
-  "Return an aligned picker line for SESSION, with its PROJECT if non-nil."
-  (cl-flet ((column (text width)
-              (truncate-string-to-width
-               (replace-regexp-in-string "[\r\n\t ]+" " " (or text "—"))
-               width nil ?\s "…")))
-    (format "%s │ %s │ %s │ %s%s%s"
-            (if-let* ((stamp (plist-get session :stamp)))
-                (format-time-string "%m-%d %H:%M" (date-to-time stamp))
-              "—          ")
-            (column (plist-get session :first) (if project 30 36))
-            (column (plist-get session :last) (if project 30 36))
-            (if project
-                (concat (column (and (plist-get session :cwd)
-                                     (abbreviate-file-name (plist-get session :cwd)))
-                                24)
-                        " │ ")
-              "")
-            (substring (plist-get session :id) 0 8)
-            (if (emacs-claude--alive-p (plist-get session :id)) " ● running" ""))))
+(defvar vertico-group-format)
+
+(defun emacs-claude--column (text width &optional face)
+  "Make TEXT a one-line column of display WIDTH, optionally in FACE."
+  (let ((column (truncate-string-to-width
+                 (string-trim (replace-regexp-in-string "[[:space:]]+" " " (or text "—")))
+                 width nil ?\s "…")))
+    (if face (propertize column 'face face) column)))
+
+(defun emacs-claude--middle-truncate (value width)
+  "Shorten VALUE to WIDTH, keeping its beginning and end."
+  (let ((total (string-width value)))
+    (if (<= total width)
+        value
+      (let* ((head (/ width 2)) (tail (- width head 1)))
+        (concat (truncate-string-to-width value head) "…"
+                (truncate-string-to-width value total (- total tail)))))))
 
 (defun emacs-claude--pick (sessions prompt &optional new-label project)
   "Choose among SESSIONS with PROMPT; return a plist, or `new' for NEW-LABEL.
-PROJECT adds a project column."
-  (let* ((choices (append (and new-label (list (cons new-label 'new)))
-                          (mapcar (lambda (session)
-                                    (cons (emacs-claude--session-label session project)
-                                          session))
-                                  sessions)))
+Columns follow emacs-pi: last user time | first query | last query |
+project (with PROJECT, on wide frames) | ID, under a header row."
+  (let* ((width (- (window-body-width (minibuffer-window)) 4))
+         (ids (mapcar (lambda (session) (plist-get session :id)) sessions))
+         (id-width 12)
+         (_ (while (< (length (delete-dups
+                                (mapcar (lambda (id) (substring id 0 (min id-width (length id))))
+                                        ids)))
+                      (length ids))
+              (cl-incf id-width)))
+         (project-width (if (and project (>= width 120)) (min 30 (/ width 6)) 0))
+         (query-space (max 12 (- width 16 id-width 9
+                                 (if (> project-width 0) (+ project-width 3) 0))))
+         (first-width (/ query-space 2))
+         (row (lambda (time first last cwd id &optional heading)
+                (string-join
+                 (append
+                  (list (emacs-claude--column time 16)
+                        (emacs-claude--column first first-width)
+                        (emacs-claude--column last (- query-space first-width)))
+                  (when (> project-width 0)
+                    (list (emacs-claude--column
+                           (emacs-claude--middle-truncate
+                            (if cwd (abbreviate-file-name cwd) "—") project-width)
+                           project-width (unless heading 'shadow))))
+                  (list (emacs-claude--column
+                         (substring id 0 (min id-width (length id)))
+                         id-width (unless heading 'shadow))))
+                 (propertize " │ " 'face 'shadow))))
+         (header (funcall row "最后交互" "用户首句" "用户末句" "项目" "ID" t))
+         (choices
+          (append
+           (and new-label (list (cons new-label 'new)))
+           (mapcar
+            (lambda (session)
+              (let ((id (plist-get session :id)))
+                (cons (concat
+                       (funcall row
+                                (if-let* ((stamp (plist-get session :stamp)))
+                                    (format-time-string "%Y-%m-%d %H:%M"
+                                                        (date-to-time stamp))
+                                  "—")
+                                (plist-get session :first) (plist-get session :last)
+                                (plist-get session :cwd) id)
+                       (if (emacs-claude--alive-p id)
+                           (propertize " ● running" 'face 'success)
+                         ""))
+                      session)))
+            sessions)))
          (table (lambda (string predicate action)
                   (if (eq action 'metadata)
-                      '(metadata (display-sort-function . identity)
-                                 (cycle-sort-function . identity))
-                    (complete-with-action action choices string predicate)))))
+                      `(metadata (category . emacs-claude-session)
+                                 (display-sort-function . identity)
+                                 (cycle-sort-function . identity)
+                                 (group-function
+                                  . ,(lambda (candidate transform)
+                                       (if transform candidate header))))
+                    (complete-with-action action choices string predicate))))
+         ;; The header is a column row, not a Vertico group title.
+         (vertico-group-format "%s")
+         (completion-ignore-case t)
+         (completion-styles (if (memq 'substring completion-styles)
+                                completion-styles
+                              (append completion-styles '(substring)))))
     (cdr (assoc (completing-read prompt table nil t) choices))))
 
 ;;;###autoload

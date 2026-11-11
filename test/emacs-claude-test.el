@@ -161,4 +161,19 @@
          (message "large prompt round trip: %.2fs" (- (float-time) start))
          (should (< (- (float-time) start) 5)))))))
 
+(ert-deftest emacs-claude-reference-provider ()
+  "TAB after @NAME inserts the file a registered provider returns."
+  (emacs-claude-test--with-chat
+   (let ((emacs-claude-reference-providers
+          `(("ashub" . ,(lambda (r) (should (equal r root)) "/tmp/ref dir/a.md")))))
+     (with-current-buffer (emacs-claude--open id root)
+       (emacs-claude--input-set "see @ashub")
+       (emacs-claude-complete)
+       (should (equal (emacs-claude--input-text) "see @\"/tmp/ref dir/a.md\" "))
+       (emacs-claude--input-set "@nothing")
+       (cl-letf (((symbol-function 'read-file-name)
+                  (lambda (&rest _) (concat root "src.el"))))
+         (emacs-claude-complete))
+       (should (equal (emacs-claude--input-text) "@src.el"))))))
+
 ;;; emacs-claude-test.el ends here

@@ -85,6 +85,8 @@ Claude 只提供「按 uuid 撤回排队消息」的接口，因此应用时会�
 所有引用合计不超过 `emacs-claude-session-reference-max-chars`（默认 20000 字符）；
 聊天界面和输入历史只显示简短引用。附加内容会作为消息的一部分保存在 Claude 的会话记录里。
 
+安装 [ashub](https://github.com/wowhxj/ashub.el) 后，输入 `@ashub` 再按 `TAB` 可引用任意 Agent 的会话：ashub 把对话导出为文件，插入 `@路径`，Claude 发送时读取该文件。其他包也可以通过 `emacs-claude-reference-providers` 注册 `@名称`（与 emacs-pi、emacs-dsh 的同名接口一致）。
+
 顶部显示上下文用量、prompt 数、费用（**当前 holder 进程累计**，不是整个会话）、模型和权限模式。
 
 ## 配置
@@ -96,6 +98,7 @@ Claude 只提供「按 uuid 撤回排队消息」的接口，因此应用时会�
 - `emacs-claude-show-thinking`
 - `emacs-claude-image-max-bytes`、`emacs-claude-pngpaste-executable`
 - `emacs-claude-session-reference-max-chars`
+- `emacs-claude-reference-providers`：`@名称` 引用提供者，`(名称 . 函数)` 列表
 
 ## 已知限制
 
