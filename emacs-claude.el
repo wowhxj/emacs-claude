@@ -218,7 +218,9 @@ Other packages, such as ashub, use this to mark background sessions."
                   (user-error "Cannot find `%s'" emacs-claude-executable)))
          (dir (emacs-claude--dir id))
          (resume (file-exists-p (emacs-claude--transcript-file id root)))
-         (coding-system-for-write 'utf-8-unix))
+         (coding-system-for-write 'utf-8-unix)
+         (process-environment (copy-sequence process-environment)))
+    (setenv "CLAUDE_CONFIG_DIR" (expand-file-name emacs-claude-config-directory))
     (with-file-modes #o700 (make-directory dir t))
     ;; The dead holder's conversation lives in Claude's transcript; keep one
     ;; previous log anyway rather than destroy it.
@@ -1635,6 +1637,37 @@ emacs-pi and emacs-dsh: last user time | first query | last query | project
                                 completion-styles
                               (append completion-styles '(substring)))))
     (cdr (assoc (completing-read prompt table nil t) choices))))
+
+;;;###autoload
+(cl-defun emacs-claude-create-session (directory &key (display t))
+  "Create a fresh Claude session in DIRECTORY, returning its chat buffer.
+With DISPLAY nil, do not select a window.  No picker or user prompt is sent."
+  (let ((buffer (emacs-claude--open (emacs-claude--uuid)
+                                     (emacs-claude--root-of directory))))
+    (when display (emacs-claude--show buffer))
+    buffer))
+
+;;;###autoload
+(cl-defun emacs-claude-open-session (id &key directory (display t))
+  "Restore exact saved session ID in DIRECTORY, returning its chat buffer.
+With DISPLAY nil, do not select a window.  This sends no user message.
+Use the configured Claude home; absent history never creates a new session."
+  (unless (and (stringp id) (string-match-p "\\`[[:alnum:]-]+\\'" id))
+    (user-error "Invalid Claude session ID"))
+  (let ((root (emacs-claude--root-of (or directory default-directory))))
+    (unless (or (emacs-claude-session-running-p id)
+                (file-readable-p (emacs-claude--transcript-file id root)))
+      (user-error "Claude history unavailable; refusing to start a substitute session"))
+    (let ((buffer (emacs-claude--open id root)))
+      (when display (emacs-claude--show buffer))
+      buffer)))
+
+;;;###autoload
+(defun emacs-claude-session-buffer (id)
+  "Return a connected chat buffer for ID, without starting or attaching it."
+  (when (emacs-claude-session-running-p id)
+    (cl-find id (emacs-claude--chats) :test #'equal
+             :key (lambda (buffer) (buffer-local-value 'emacs-claude--id buffer)))))
 
 ;;;###autoload
 (defun emacs-claude-chat (root)

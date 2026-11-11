@@ -101,6 +101,20 @@ Claude 只提供「按 uuid 撤回排队消息」的接口，因此应用时会�
 - `emacs-claude-session-reference-max-chars`
 - `emacs-claude-reference-providers`：`@名称` 引用提供者，`(名称 . 函数)` 列表
 
+## 外部调用恢复 API
+
+```elisp
+(emacs-claude-create-session project-directory :display nil)
+(emacs-claude-open-session session-id :directory project-directory :display nil)
+```
+
+新建接口每次生成全新 ID，不弹历史选择器；恢复接口精确使用给定 ID。
+均返回原生聊天 buffer，不选择窗口（省略 `:display nil` 时显示），不发送用户消息。
+使用当前 `emacs-claude-config-directory`；无存活 holder 且历史缺失时明确拒绝，
+不会把恢复变成新建会话。返回 UI 不代表模型已开始/完成生成。
+`emacs-claude-session-buffer` 被动返回已连接的 UI，
+`emacs-claude-session-running-p` 查询 holder，均不启动会话。
+
 ## 已知限制
 
 - 空闲的 holder 不会自动退出；用 `C-c C-q` 关闭，或用 `emacs-claude-attach` 找回。
@@ -116,7 +130,7 @@ Claude 只提供「按 uuid 撤回排队消息」的接口，因此应用时会�
 ## 测试
 
 ```sh
-emacs -Q --batch -L /path/to/markdown-mode -L . -l test/emacs-claude-test.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -L /path/to/markdown-mode -L . -l test/emacs-claude-test.el -l test/public-api-test.el -f ert-run-tests-batch-and-exit
 ```
 
 使用 `test/fake-claude.py`，不调用真实模型。
